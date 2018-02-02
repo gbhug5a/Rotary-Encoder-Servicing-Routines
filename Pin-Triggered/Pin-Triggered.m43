@@ -1,0 +1,296 @@
+;Pin-Triggered.m43
+;Naken Assembler
+
+.msp430
+.include "msp430g2231.inc"
+
+; This application tests the general pin-triggered interrupt servicing routine
+; for a rotary encoder as described in the accompanying PDF file.  This code
+; specifically applies to the Texas Instruments MSP430G2231 microprocessor
+; operating at 1 MHz, but could be applied to Arduino and other processors with
+; similar capabilities.  The MSP430s can enable interrupts on individual port pins,
+; on either the rising edge or the falling edge.  There is no "any change" interrupt.
+
+; The routine recognizes that a tick has occurred only when both pins first arrive at
+; the same state - either 00b or 11b.  And for encoders which go through a complete
+; cycle between detents (pulses = detents) only the 11b tick is recognized.
+
+; An interrupt is enabled on only one pin at a time.  When an interrupt
+; is triggered on that pin, we immediately switch the interrupt to the other pin.
+; So any bouncing which may occur on the first pin will not trigger any interrupts.
+; That greatly reduces the number of interrupts to be serviced, and produces more
+; valid results.
+;
+; With the appropriate #define, this will work for encoders with the same number
+; of pulses as detents per revolution, as well as for those with half as many pulses
+; as detents.  In either case, the code produces one transition tick per detent.
+;
+; The code assumes the chip is installed on the Launchpad, with the encoder pins
+; connected to P1.4 and P1.5, but any two pins can be used so long as both are on the
+; same port.  The code flashes the green LED (P1.6) for every clockwise detent and
+; the red LED (P1.0) for every counter-clockwise detent.  Ideally, only one should
+; light up for any rotation in one direction.
+
+; Define pins and port used for encoder
+
+#define CWPIN           16              ;These pins: Bit 4 - This pin leads on CW rotation
+#define CCWPIN          32              ;   and Bit 5 - This pin leads on CCW rotation
+#define PORT            P1IN            ;On this I/O port
+#define INT_VECTOR      PORT1_VECTOR    ;   which uses this interrupt vector
+
+#define ENCODERTYPE     0               ; Encoder has pulses = detents per rev
+;#define ENCODERTYPE     1               ; Encoder has pulses = detents/2 per rev
+                                        ; If you get a tick every other detent, try 1 here
+                                        ; If you get two ticks per detent, set it to 0
+
+#define CWTEST          CCWPIN          ; If encoder operates backwards, reverse the encoder
+                                        ;     leads or change the value here to CWPIN
+
+; Define pins and ports used for LED indicators
+
+#define CWLED           64              ;P1.6 - Green LED flashed each CW detent
+#define CWLEDPORT       P1IN
+#define CCWLED          1               ;P1.0 - Red LED flashed each CCW detent
+#define CCWLEDPORT      P1IN
+
+; This is the end of everything needed to set the ports, pins, type of encoder and
+; encoder direction. Beyond this point the only thing that might need to be changed
+; is what is to be done to process a tick - something other than flashing an LED.
+; That section is at "FlashLEDs".
+
+; Define related encoder registers
+
+#define PORTOUT         PORT + 1        ; Set resistor direction (1 = pullup)
+#define PORTDIR         PORT + 2        ; Set I/O direction (1 = output)
+#define FLAGS           PORT + 3        ; Flags set when interrupt occurs - must be cleared
+#define EDGES           PORT + 4        ; Interrupt on Rising (0) or Falling (1) edge
+#define ENABLE          PORT + 5        ; Interrupt enable bits (1 = enabled)
+#define RESISTORS       PORT + 7        ; Enable resistors (1 = enabled)
+
+; Define related LED registers
+
+#define CWOUT           CWLEDPORT + 1
+#define CWDIR           CWLEDPORT + 2
+#define CWRESTR         CWLEDPORT + 7
+
+#define CCWOUT          CCWLEDPORT + 1
+#define CCWDIR          CCWLEDPORT + 2
+#define CCWRESTR        CCWLEDPORT + 7
+
+; Other definitions
+
+#define PINS            CWPIN + CCWPIN  ; Combined encoder pins
+#define CCWTEST         PINS - CWTEST
+
+; Define registers used (or could be RAM locations)
+
+#define TARGET          R10             ; Pin state we're looking for
+#define CURRENT         R11             ; Current pin state
+#define PREVIOUS        R12             ; Pin state on previous interrupt
+#define TICK            R13             ; Direction of tick if one occurs
+#define TEMP            R14
+
+.org            0xF800
+
+PowerUp:
+
+; Standard setup for this processor
+
+        mov.w   #0x0280,        SP              ;set stack pointer to top of RAM
+        mov.w   #WDTPW+WDTHOLD, &WDTCTL         ;disable Watchdog timer
+        mov.b   #0,             &IFG1           ;clear flags
+
+        ; Set main clock to 1MHz
+
+        mov.w   &CALDCO_1MHZ,   TEMP            ;Calibrated 1MHz values
+        mov.b   TEMP,           &DCOCTL         ;set clock to 1 MHz
+        swpb    TEMP
+        mov.b   TEMP,           &BCSCTL1
+
+        ; Initialize both I/O ports to inputs with pull-down resistors - no floating inputs
+
+        mov.b   #0,             &P1OUT          ;Resistor direction - down
+        mov.b   #0,             &P1DIR          ;Port direction - inputs
+        mov.b   #0xFF,          &P1REN          ;Enable resistors
+
+        mov.b   #0,             &P2SEL          ;Restores P2.6 and P2.7 to I/O
+        mov.b   #0,             &P2OUT
+        mov.b   #0,             &P2DIR
+        mov.b   #0xFF,          &P2REN
+
+;Specific setup for LEDs
+
+        bic.b   #CWLED,         &CWRESTR        ;Disable pulldown
+        bic.b   #CWLED,         &CWOUT          ;Output level = low (LED off)
+        bis.b   #CWLED,         &CWDIR          ;Make pin an output
+
+        bic.b   #CCWLED,        &CCWRESTR
+        bic.b   #CCWLED,        &CCWOUT
+        bis.b   #CCWLED,        &CCWDIR
+
+; Specfic setup for encoder
+
+        bic.b   #PINS,          &PORTDIR        ;Encoder pins are I/O inputs
+        bis.b   #PINS,          &PORTOUT        ;Resistors are pull-UP
+        bis.b   #PINS,          &RESISTORS      ;Pullups enabled
+
+        mov.b   #0,             TARGET          ;Assume both start high, look for both low
+        bis.b   #PINS,          &EDGES          ;  and trigger on falling edge
+        mov.b   &PORT,          CURRENT         ;Read current state of port
+        and.b   #PINS,          CURRENT         ;Mask out other bits
+        jnz     SetUpInt                        ;If CURRENT not 00b
+        mov.b   #PINS,          TARGET          ;If CURRENT = 00b, change TARGET to 11b
+        bic.b   #PINS,          &EDGES          ;  and trigger on rising edge
+
+SetUpInt:
+
+        bic.b   #PINS,          &FLAGS          ;Clear any pending interrupt flags
+        bis.b   #CWPIN,         &ENABLE         ;Enable interrupt on ONE pin
+        bis.w   #CPUOFF+GIE,    SR              ;Turn off CPU, enable general interrupts
+
+;The processor is now shut down.  It will awaken to process an interrupt, then sleep.
+
+
+.org            0xFC00
+
+; This is the interrupt service routine, triggered by activity on the encoder pins
+
+IntService:
+
+        mov.b   #0,             TICK            ;No tick unless we find one
+        mov.b   CURRENT,        PREVIOUS        ;Save previous reading
+        mov.b   &PORT,          CURRENT         ;Read current state of pins
+        and.b   #PINS,          CURRENT         ;Mask out other bits
+
+; Because of the delay between the interrupt and the read of the port, bouncing may have
+; changed the value of the pin which caused the interrupt.  So we replace the value read with
+; what we know it was - if we are set for a falling edge, then that pin must have been low,
+; and vice versa.  The non-interrupting pin is assumed to be stable, so its read is valid.
+
+        bic.b   &ENABLE,        CURRENT         ;Clear the bit that caused the interrupt
+
+        mov.b   &EDGES,         TEMP            ;Load EDGES register
+        and.b   #PINS,          TEMP            ;Mask out other edges
+        xor.b   #PINS,          TEMP            ;Invert ours (EDGES logic is backwards)
+        and.b   &ENABLE,        TEMP            ;Mask for only the bit enabled
+        bis.b   TEMP,           CURRENT         ;OR that into CURRENT
+
+; Now see if current pins state equals our target.  If not, we're done.
+
+        cmp.b   CURRENT,        TARGET          ;TARGET is either 00b or 11b
+        jnz     OtherPin                        ;No tick here - switch INT to other pin
+
+; We now have a tick unless both pins are low and it's a type-0 encoder (those tick only
+; when both go high).
+
+        cmp.b   #ENCODERTYPE,   TARGET          ;If type-0 encoder, tick only if TARGET=11b
+        jz      InvertTarget
+
+; If the direction changes, then the pin which should have been the first to change will be
+; the last to change, and we will have had no interrupt when the other pin changed first.
+; So we need to reconstruct what that missed interrupt looked like, and put it in PREVIOUS.
+; If we have reached a target, and PREVIOUS is also a target value (either 00b or 11b) then
+; we missed an interrupt.
+
+        cmp.b   #0,             PREVIOUS        ;If PREVIOUS = 00b, we missed an interrupt
+        jz      Reconstruct
+        cmp.b   #PINS,          PREVIOUS        ;If PREVIOUS = 11B, also a missed one
+        jnz     Direction
+
+; We know the interrupting pin is correct in PREVIOUS because it is only now changing.
+; But the other pin actually changed earlier but there was no interrupt. So we invert its
+; value in PREVIOUS.  PREVIOUS then contains the correct value for the missed interrupt
+
+Reconstruct:
+
+        mov.b   #PINS,          TEMP            ;Both pins
+        bic.b   &ENABLE,        TEMP            ;Select only the non-triggering pin
+        xor.b   TEMP,           PREVIOUS        ;Invert its value in PREVIOUS
+
+; Now determine the direction of the tick
+
+Direction:
+
+        mov.b   CURRENT,        TICK            ;Direction = CURRENT XOR PREVIOUS
+        xor.b   PREVIOUS,       TICK            ;   10b = CW, 01b = CCW
+
+; Flash the LED for that direction, or other processing
+
+FlashLEDs:
+
+        cmp.b   #CWTEST,        TICK
+        jnz     TestCCW
+
+        bis.b   #CWLED,         &CWOUT
+        call    #Delay
+        bic.b   #CWLED,         &CWOUT
+        jmp     InvertTarget
+
+TestCCW:
+
+        cmp.b   #CCWTEST,       TICK
+        jnz     NoTick
+        bis.b   #CCWLED,        &CCWOUT
+        call    #Delay
+        bic.b   #CCWLED,        &CCWOUT
+        jmp     InvertTarget
+
+NoTick:
+
+        mov.b   #0,             TICK
+
+; Another possibility is to just return from the interrupt with TICK containing a value
+; which is 1 for a CW tick, -1 for a CCW tick, or zero for no tick.  Then the main code
+; would process that value.
+
+;FlashLEDs:
+;
+;        cmp.b   #CWTEST,        TICK
+;        jnz     TestCCW
+;        mov.b   #1,             TICK
+;        jmp     InvertTarget
+;
+;TestCCW:
+;
+;        cmp.b   #CCWTEST,       TICK
+;        jnz     NoTick
+;        mov.b   #0xFF,          TICK
+;        jmp     InvertTarget
+;
+;NoTick:
+;
+;        mov.b   #0,             TICK
+
+
+; After a tick is processed, we invert both the target and the edge direction
+
+InvertTarget:
+
+        xor.b   #PINS,          TARGET          ;Invert TARGET
+        xor.b   #PINS,          &EDGES          ;Invert trigger edges
+
+; Move the interrupt enable to the settled other pin, and avoid all switch bouncing.
+
+OtherPin:
+
+        xor.b   #PINS,          &ENABLE         ;Switch interrupt to other pin
+        bic.b   #PINS,          &FLAGS          ;Clear any flags
+        reti                                    ;We are done
+
+
+Delay:
+
+        mov.w   #40,            TEMP            ;Delay counter
+
+Again:
+
+        dec.w   TEMP
+        jnz     Again
+        ret
+
+
+.org    INT_VECTOR
+.dw     IntService
+
+.org    RESET_VECTOR
+.dw     PowerUp
