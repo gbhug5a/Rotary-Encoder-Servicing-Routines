@@ -7,3 +7,7 @@ These routines are efficient and work well with no hardware debouncing.
 Encoders with pulses=detents, and pulses=detents/2, are supported.
 Examples in assembler are included for the TI MSP430 processors.
 Everything is explained in the PDF.
+
+A second PDF has been added describing a polling routine for reading
+multiple push-button switches.
+
