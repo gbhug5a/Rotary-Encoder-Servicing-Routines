@@ -1,4 +1,5 @@
 ;Polling.m43
+; v2.0
 ;Naken Assembler
 
 .msp430
@@ -43,18 +44,25 @@
 ; and current would be drawn continuously through the pullup resistors.  This code does
 ; that just-in-time enabling of the pullup resistors.
 
+.org            0xF800
+
+EncoderType:
+
+.dw	0			 	; Encoder has pulses = detents per rev
+;.dw	1				; Encoder has pulses = detents/2 per rev
+					; If you get a tick every other detent, try 1 here
+                                        ; If you get two ticks per detent, set it to 0
+
+
 ; Define pins and port used for encoder
 
 #define CWPIN           16              ;These pins: Bit 4 - This pin leads on CW rotation
 #define CCWPIN          32              ;   and Bit 5 - This pin leads on CCW rotation
 #define PORT            P1IN            ;On this I/O port
 
-#define ENCODERTYPE     0               ; Encoder has pulses = detents per rev
-;#define ENCODERTYPE     1               ; Encoder has pulses = detents/2 per rev
-                                        ; If you get a tick every other detent, try 1 here
-                                        ; If you get two ticks per detent, set it to 0
+#define FREQ            0               ; Interrupts per second - 0 = 244, 1 = 488
+;#define FREQ            1               ; Interrupts per second - 0 = 244, 1 = 488
 
-#define FREQ            1               ; Interrupts per second - 0 = 244, 1 = 488
 #define CWTEST          CCWPIN          ; If encoder operates backwards, reverse the encoder
                                         ;     leads or change the value here to CWPIN
 
@@ -68,7 +76,7 @@
 ; This is the end of everything needed to specify the ports, pins, type of encoder,
 ; encoder direction, and interrupt frequency. Beyond this point the only thing that
 ; might need to be changed is what is to be done to process a tick - something other
-; than flashing an LED.  That section is at "FlashLEDs".
+; than flashing an LED.
 
 ; Define related encoder registers
 
@@ -93,13 +101,14 @@
 
 ; Define registers used (or could be RAM locations)
 
+#define TEMP            R8
+#define TEMP2           R9
 #define TARGET          R10             ; Pin state we're looking for
 #define CURRENT         R11             ; Current pin state
 #define PREVIOUS        R12             ; Pin state on previous interrupt
 #define TICK            R13             ; Direction of tick if one occurs
-#define TEMP            R14
+#define CUMLTICK        R14             ; Two ticks required if type-0 encoder
 
-.org            0xF800
 
 PowerUp:
 
@@ -140,8 +149,9 @@ PowerUp:
 ; Specfic setup for encoder
 
         bic.b   #PINS,          &PORTDIR        ;Encoder pins are I/O inputs
-        bis.b   #PINS,          &PORTOUT        ;Resistors are pull-up
+        bis.b   #PINS,          &PORTOUT        ;Resistors are pull-UP
         bis.b   #PINS,          &RESISTORS      ;Pullups enabled
+	mov.b	#0,		CUMLTICK
 
         mov.b   #0,             TARGET          ;Assume both start high, look for both low
         mov.b   &PORT,          CURRENT         ;Read current state of port
@@ -162,10 +172,40 @@ SetUpInt:
         mov.w   #WDTPW+WDTTMSEL+WDTCNTCL+WDTIS2, &WDTCTL ;Int timer, SMCLK/512, count=0, ON
         mov.b   #0,             &IFG1           ;clear all flags
         bis.b   #1,             &IE1            ;enable WDT interrupts
-        bis.w   #CPUOFF+GIE,    SR              ;Turn off CPU, enable general interrupts
 
-;The processor is now shut down.  It will awaken to process an interrupt, then sleep.
 
+Loop:                                           ;Look for a tick in either direction
+
+	dint
+	mov.b	TICK,		TEMP2           ;Read and clear TICK
+	mov.b	#0,		TICK
+	eint
+
+	cmp.b	#1,		TEMP2		;has there been a CW tick?
+        jnz     TestCCW
+        bis.b   #CWLED,         &CWOUT          ;yes - flash green LED
+        call    #Delay
+        bic.b   #CWLED,         &CWOUT
+        jmp     Loop
+
+TestCCW:
+
+        cmp.b   #0xFF,		TEMP2		;how about CCW?
+        jnz     Loop
+        bis.b   #CCWLED,        &CCWOUT         ;yes - flash red LED
+        call    #Delay
+        bic.b   #CCWLED,        &CCWOUT
+        jmp     Loop
+
+Delay:
+
+        mov.w   #40,            TEMP2           ;Delay counter
+
+Again:
+
+        dec.w   TEMP2
+        jnz     Again
+        ret
 
 .org            0xFC00
 
@@ -183,12 +223,6 @@ IntService:
         cmp.b   CURRENT,        TARGET          ;TARGET is either 00b or 11b
         jnz     Exit                            ;If not, no tick - Return from interrupt
 
-; We now have a tick unless both pins are low and it's a type-0 encoder (those tick only
-; when both go high).
-
-        cmp.b   #ENCODERTYPE,   TARGET          ;If type-0 encoder, tick only if TARGET=11b
-        jz      InvertTarget
-
 ; Now determine the direction of the tick
 
 Direction:
@@ -196,52 +230,55 @@ Direction:
         mov.b   CURRENT,        TICK            ;Direction = CURRENT XOR PREVIOUS
         xor.b   PREVIOUS,       TICK            ;   10b = CW, 01b = CCW
 
-; Flash the LED for that direction, or other processing
+; Return from the interrupt with TICK containing a value which is 1 for a CW tick,
+; -1 for a CCW tick, or zero for no tick.  Then the main code will process that value.
 
-FlashLEDs:
+DoTICK:
 
         cmp.b   #CWTEST,        TICK
-        jnz     TestCCW
+        jnz     DoCCW
+        mov.b   #1,             TICK
+	inc.b	CUMLTICK
+        jmp     TestType
 
-        bis.b   #CWLED,         &CWOUT
-        call    #Delay
-        bic.b   #CWLED,         &CWOUT
-        jmp     InvertTarget
-
-TestCCW:
+DoCCW:
 
         cmp.b   #CCWTEST,       TICK
-        jnz     NoTick
-        bis.b   #CCWLED,        &CCWOUT
-        call    #Delay
-        bic.b   #CCWLED,        &CCWOUT
-        jmp     InvertTarget
+        jnz     ClearBoth
+        mov.b   #0xFF,          TICK
+	dec.b	CUMLTICK
 
-NoTick:
+TestType:
 
-        mov.b   #0,             TICK
+	cmp.w	#0,		&EncoderType
+	jnz	InvertTarget
 
-; Another possibility is to just return from the interrupt with TICK containing a value
-; which is 1 for a CW tick, or -1 for a CCW tick.  Then the main code would process that
-; value and clear the TICK byte.
+	cmp.b	#0,		TARGET
+	jz	ClearTICK
 
-;FlashLEDs:
-;
-;        cmp.b   #CWTEST,        TICK
-;        jnz     TestCWW
-;        mov.b   #1,             TICK
-;        jmp     InvertTarget
-;
-;TestCWW:
-;
-;        cmp.b   #CCWTEST,       TICK
-;        jnz     NoTick
-;        mov.b   #0xFF,          TICK
-;        jmp     InvertTarget
-;
-;NoTick:
-;
-;        mov.b   #0,             TICK
+Check2:
+
+	cmp.b   #2,		CUMLTICK
+	jnz	Checkneg
+
+ClearCuml:
+
+	mov.b	#0,		CUMLTICK
+	jmp	InvertTarget
+
+Checkneg:
+
+	cmp.b	#0xFE,		CUMLTICK
+	jz	ClearCuml
+
+ClearBoth:
+
+	mov.b	#0,		CUMLTICK
+
+ClearTICK:
+
+	mov.b	#0,             TICK
+
 
 ; After a tick is processed, we invert the TARGET
 
@@ -252,16 +289,6 @@ InvertTarget:
 Exit:
 
         reti                                    ;And return from interrupt
-
-Delay:
-
-        mov.w   #40,            TEMP            ;Delay counter
-
-Again:
-
-        dec.w   TEMP
-        jnz     Again
-        ret
 
 
 .org    WDT_VECTOR
