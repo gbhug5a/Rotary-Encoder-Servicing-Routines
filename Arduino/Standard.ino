@@ -16,8 +16,8 @@ one tick per detent.  For Type 0, that is only when both switches are open.
 For Type 1 encoders, switches can be either both open or both closed at a detent.
 
 The encoder pins are connected to D4 and D5, but any two pins can be used so long
-as both are on the same port.  The code flashes an LED on A4 for every clockwise
-detent and an LED on A5 for every counter-clockwise detent.  The serial monitor
+as both are on the same port.  The code flashes an LED on A1 for every clockwise
+detent and an LED on A2 for every counter-clockwise detent.  The serial monitor
 will show the total number of interrupts which have been serviced between detents,
 which ideally would be 4 for a Type 0 encoder, and 2 for a Type 1.
 
