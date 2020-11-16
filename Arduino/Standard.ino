@@ -24,13 +24,14 @@ which ideally would be 4 for a Type 0 encoder, and 2 for a Type 1.
 Pin change interrupts are used. In the ISR, direct register access is used to read
 the port and manage the interrupt enables.
 */
-
+                                           
 const int aPIN = 4;                     // encoder pins
 const int bPIN = 5;
 const int CWLED = A1;                   // LED pins
 const int CCWLED = A2;
 const int LEDdelay = 8;                 // blink time of LEDs - ms
 
+#define pinZero 0                       // data pin name of PB0 (8), PC0 (A0) or PD0 (0)
 #define PORT PIND                       // port input register (port D includes D4 and D5)
 #define portVECT PCINT2_vect            // The ISR vector for port D pin change interrupt
 #define portINT PCIE2                   // enable pin change interrupts on port D
@@ -42,8 +43,8 @@ const byte encoderType = 0;             // encoder with equal # of detents & pul
 
 const int THRESH =(4-(2*encoderType));  // transitions needed to recognize a tick - type 0 = 4, type 1 = 2
 
-const byte CWPIN = bit(aPIN);           // bit value for switch that leads on CW rotation
-const byte CCWPIN = bit(bPIN);          // bit value for switch that leads on CCW rotation
+const byte CWPIN = bit(aPIN - pinZero);  // bit value for switch that leads on CW rotation
+const byte CCWPIN = bit(bPIN - pinZero); // bit value for switch that leads on CCW rotation
 const byte PINS = CWPIN + CCWPIN;       // sum of bit values of the encoder pins
 const byte ZEERO = 0x80;                // byte data type doesn't do negative
 
