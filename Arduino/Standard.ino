@@ -1,5 +1,5 @@
 /*
-Standard lookup table method - both pin-change interrupts enabled.
+Standard lookup table method - pin-change interrupts enabled.
 
 This application demonstrates a pin-triggered interrupt servicing routine
 for a rotary encoder.  This code specifically applies to Arduinos using the
@@ -16,10 +16,10 @@ one tick per detent.  For Type 0, that is only when both switches are open.
 For Type 1 encoders, switches can be either both open or both closed at a detent.
 
 The encoder pins are connected to D4 and D5, but any two pins can be used so long
-as both are on the same port.  The code flashes an LED on A1 for every clockwise
-detent and an LED on A2 for every counter-clockwise detent.  The serial monitor
-will show the total number of interrupts which have been serviced between detents,
-which ideally would be 4 for a Type 0 encoder, and 2 for a Type 1.
+as both are on the same port. The serial monitor will show the cumullative value
+of the encoder at each detent, fowwoed by the total number of interrupts which have
+been serviced since the last detent, which ideally would be 4 for a Type 0 encoder,
+and 2 for a Type 1.
 
 Pin change interrupts are used. In the ISR, direct register access is used to read
 the port and manage the interrupt enables.
@@ -27,9 +27,11 @@ the port and manage the interrupt enables.
                                            
 const int aPIN = 4;                     // encoder pins
 const int bPIN = 5;
-const int CWLED = A1;                   // LED pins
-const int CCWLED = A2;
-const int LEDdelay = 8;                 // blink time of LEDs - ms
+
+/*  This section defines the port being used for the encoder pins, along with the PCI registers
+    and interrupt vector.  The values shown here are for Port D (D0 - D7), but Port B (D8 - D13)
+    or Port C(A0 - A5) could also be used.
+*/
 
 #define pinZero 0                       // data pin name of PB0 (8), PC0 (A0) or PD0 (0)
 #define PORT PIND                       // port input register (port D includes D4 and D5)
@@ -51,11 +53,9 @@ const byte ZEERO = 0x80;                // byte data type doesn't do negative
 byte CURRENT;                           // the current state of the switches
 byte TOTAL = ZEERO;                     // accumulated transitions since last tick (0x80 = none)
 byte INDEX = 0;                         // Index into lookup state table
-byte numPrints = 0;                     // # items printed on line
-volatile byte NUMINTS = 0;              // # interrupts since last detent
-volatile byte intArray[256];            // circular buffer of interrupts per detent/tick
-volatile byte beginINT = 0;
-volatile byte endINT = 0;
+byte NUMINTS = 0;                       // # interrupts since last detent
+int Setting = 0;                        // current accumulated value set by rotary encoder
+
 volatile byte tickArray[256];           // circular buffer of ticks
 volatile byte beginTICK = 0;
 volatile byte endTICK = 0;
@@ -64,21 +64,12 @@ volatile byte endTICK = 0;
 
 int ENCTABLE[]  = {0,1,-1,0,-1,0,0,1,1,0,0,-1,0,-1,1,0};
 
-byte tickTime;                          //  countdown timers for LEDs
-unsigned long newMilli;
-unsigned long oldMilli = 0;
-
 void setup() {
 
-  Serial.begin(9600);
+  Serial.begin(115200);
 
-  pinMode(CWLED, OUTPUT);               // set up LED pins - LOW = off
-  digitalWrite(CWLED, LOW);
-  pinMode(CCWLED, OUTPUT);
-  digitalWrite(CCWLED, LOW);
-
-  pinMode(aPIN, INPUT_PULLUP);          // set up encoder pins as INPUT-PULLUP
-  pinMode(bPIN, INPUT_PULLUP);
+  pinMode(aPIN, INPUT);                 // set up encoder pins as INPUT. Assumes external 10K pullups
+  pinMode(bPIN, INPUT);
 
   if(PORT & PINS) INDEX = 3;            // Initialize INDEX to current state
   
@@ -89,37 +80,15 @@ void setup() {
 
 void loop() {
 
-  if(beginINT != endINT) {              // serial print number of interrupts
-    beginINT++;
-    Serial.print(intArray[beginINT]); Serial.print(" ");
-    numPrints++;
-    if(numPrints == 20) Serial.println(), numPrints = 0;
-  }
-
-  if((beginTICK != endTICK) && (tickTime == 0)) {
+  if(beginTICK != endTICK) {            // if anything in circular buffer
 
     beginTICK++;
-    
-    if(tickArray[beginTICK] == 1) {     // flash LEDs as needed
-      digitalWrite(CWLED,HIGH);
-      tickTime = LEDdelay;
-    }
-    else if(tickArray[beginTICK] == 0xFF) {
-      digitalWrite(CCWLED,HIGH);
-      tickTime = LEDdelay;
-    }
-  }
+    if(tickArray[beginTICK] == 1) Setting ++; // print Setting
+    else Setting--;
 
-  newMilli = millis();                  // countdown LED
-  if (newMilli > oldMilli) {
-    oldMilli = newMilli;
-    if (tickTime) {
-      tickTime--;
-      if (tickTime == 0) {
-        digitalWrite (CWLED, LOW);
-        digitalWrite (CCWLED, LOW);
-      }
-    }
+    Serial.print(Setting); Serial.print(" ");
+    beginTICK++;
+    Serial.println(tickArray[beginTICK]); // print number of interrupts since last detent
   }
 }
 
@@ -132,20 +101,20 @@ ISR (portVECT) {                        // pin change interrupt service routine.
   if(CURRENT & CCWPIN) bitSet(INDEX,1); // If CCWPIN is high, set INDEX bit 1
   INDEX &= 15;                          // Mask out all but prev and current
 
-  NUMINTS++;                            // just for this demo - not normally needed
-
 // INDEX is now a four-bit index into the 16-byte ENCTABLE state table
 
   TOTAL += ENCTABLE[INDEX];             //Accumulate transitions
 
-  if((CURRENT == PINS) || ((CURRENT == 0) && encoderType)) {  //A valid tick can occur only at a detent
+  NUMINTS++;                            // just for this demo - not normally needed
+
+  if((CURRENT == PINS) || ((CURRENT == 0) && encoderType)) {  // A valid tick can occur only at a detent
 
     if(TOTAL == (ZEERO + THRESH)) {
       endTICK++;
       tickArray[endTICK] = 1;
-      
-      endINT++;
-      intArray[endINT] = NUMINTS;
+
+      endTICK++;
+      tickArray[endTICK] = NUMINTS;
       NUMINTS = 0;
     }
 
@@ -153,8 +122,8 @@ ISR (portVECT) {                        // pin change interrupt service routine.
       endTICK++;
       tickArray[endTICK] = 0xFF;
 
-      endINT++;
-      intArray[endINT] = NUMINTS;
+      endTICK++;
+      tickArray[endTICK] = NUMINTS;
       NUMINTS = 0;
     }
     TOTAL = ZEERO;                          //Always reset TOTAL to 0x80 at detent
